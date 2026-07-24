@@ -119,3 +119,8 @@ jobs:
 
       - name: Test Community workflow automation
         run: node --test script/github/issue-claim.test.js script/github/sync-community-project.test.js
+
+      - name: Test QQ notification automation
+        run: |
+          python3 script/github/test_notify_qq.py
+          python3 script/github/qq_relay/test_relay_server.py
