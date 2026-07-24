@@ -24,12 +24,7 @@ class NotificationFormattingTest(unittest.TestCase):
         }
 
         message = notify_qq.build_notification(
-            "issues",
-            payload,
-            "OtterMind/Chat2DB",
-            "alice",
-            "",
-            include_url=True,
+            "issues", payload, "OtterMind/Chat2DB", "alice", "", include_url=True
         )
 
         self.assertIn("Issue #42 已打开", message)
@@ -65,12 +60,7 @@ class NotificationFormattingTest(unittest.TestCase):
         }
 
         message = notify_qq.build_notification(
-            "pull_request_target",
-            payload,
-            "OtterMind/Chat2DB",
-            "bob",
-            "",
-            include_url=True,
+            "pull_request_target", payload, "OtterMind/Chat2DB", "bob", "", include_url=True
         )
 
         self.assertIn("PR #88 已合并", message)
@@ -86,12 +76,7 @@ class NotificationFormattingTest(unittest.TestCase):
         }
 
         message = notify_qq.build_notification(
-            "pull_request_target",
-            payload,
-            "OtterMind/Chat2DB",
-            "carol",
-            "",
-            include_url=False,
+            "pull_request_target", payload, "OtterMind/Chat2DB", "carol", "", include_url=False
         )
 
         self.assertIn("提交已更新", message)
@@ -146,7 +131,7 @@ class NotificationFormattingTest(unittest.TestCase):
         self.assertIn("内容：hello QQ", message)
         self.assertIn("actions/runs/123", message)
 
-    def test_url_free_fallback_removes_urls_from_untrusted_title(self):
+    def test_url_can_be_omitted(self):
         payload = {
             "action": "opened",
             "issue": {
@@ -165,65 +150,48 @@ class NotificationFormattingTest(unittest.TestCase):
         self.assertIn("[链接已省略]", message)
 
 
-class QQAPIClientTest(unittest.TestCase):
-    @patch("notify_qq.send_group_message")
-    def test_url_rejection_retries_without_url(self, send_group_message):
-        send_group_message.side_effect = [
-            notify_qq.QQAPIError(400, notify_qq.URL_REJECTED_CODE, "URL rejected"),
-            {"id": "message-2"},
-        ]
-
-        response, removed_url = notify_qq.send_with_url_fallback(
-            "group", "token", "with URL", "without URL"
-        )
-
-        self.assertEqual({"id": "message-2"}, response)
-        self.assertTrue(removed_url)
-        self.assertEqual(
-            [("group", "token", "with URL"), ("group", "token", "without URL")],
-            [call.args for call in send_group_message.call_args_list],
-        )
-
-    @patch("notify_qq.urlopen")
-    def test_access_token_request_uses_official_contract(self, urlopen_mock):
-        response = unittest.mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps(
-            {"access_token": "secret-token", "expires_in": "7200"}
-        ).encode()
-        urlopen_mock.return_value = response
-
-        token = notify_qq.get_access_token("app-id", "client-secret")
-
-        self.assertEqual("secret-token", token)
-        request = urlopen_mock.call_args.args[0]
-        self.assertEqual(notify_qq.TOKEN_URL, request.full_url)
-        self.assertEqual("POST", request.method)
-        self.assertEqual(
-            {"appId": "app-id", "clientSecret": "client-secret"},
-            json.loads(request.data.decode()),
-        )
-
+class RelayClientTest(unittest.TestCase):
     @patch("notify_qq._post_json")
-    def test_group_message_uses_openid_and_qqbot_authorization(self, post_json):
-        post_json.return_value = {"id": "message-id"}
+    def test_relay_request_uses_bearer_token_and_delivery_id(self, post_json):
+        post_json.return_value = {"ok": True, "message_id": "42"}
 
-        response = notify_qq.send_group_message("group/with space", "access-token", "hello")
-
-        self.assertEqual({"id": "message-id"}, response)
-        post_json.assert_called_once_with(
-            "https://api.bot.qq.com/v2/groups/group%2Fwith%20space/messages",
-            {"msg_type": 0, "content": "hello"},
-            {"Authorization": "QQBot access-token"},
+        response = notify_qq.send_relay_message(
+            "https://qq-relay.example.com/v1/qq/github",
+            "relay-secret",
+            "OtterMind/Chat2DB",
+            "123456",
+            "hello",
         )
 
-    def test_api_error_decodes_provider_code(self):
-        error = HTTPError("https://example.invalid", 400, "Bad Request", {}, io.BytesIO())
-        body = json.dumps({"code": 40054010, "message": "URL rejected"}).encode()
+        self.assertEqual("42", response["message_id"])
+        post_json.assert_called_once_with(
+            "https://qq-relay.example.com/v1/qq/github",
+            {
+                "repository": "OtterMind/Chat2DB",
+                "delivery_id": "123456",
+                "message": "hello",
+            },
+            {"Authorization": "Bearer relay-secret"},
+        )
 
-        decoded = notify_qq._decode_api_error(error.code, body)
+    def test_relay_url_must_use_https(self):
+        with self.assertRaises(notify_qq.ConfigurationError):
+            notify_qq.send_relay_message(
+                "http://relay.internal/v1/qq/github",
+                "token",
+                "OtterMind/Chat2DB",
+                "123",
+                "hello",
+            )
 
-        self.assertEqual(40054010, decoded.code)
-        self.assertIn("URL rejected", str(decoded))
+    def test_api_error_is_sanitized(self):
+        error = HTTPError("https://example.invalid", 401, "Unauthorized", {}, io.BytesIO())
+        body = json.dumps({"error": "invalid relay token"}).encode()
+
+        decoded = notify_qq._decode_relay_error(error.code, body)
+
+        self.assertEqual(401, decoded.status)
+        self.assertIn("invalid relay token", str(decoded))
 
     def test_manual_dry_run_does_not_require_secrets(self):
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event_file:

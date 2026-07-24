@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send GitHub Issue and pull request changes to an official QQ group bot."""
+"""Send GitHub Issue and pull request changes through the Chat2DB QQ relay."""
 
 from __future__ import annotations
 
@@ -12,14 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
-TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
-API_BASE_URL = "https://api.bot.qq.com"
 TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
-URL_REJECTED_CODE = 40054010
 URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 
 ISSUE_ACTIONS = {
@@ -67,18 +64,16 @@ PULL_REQUEST_ACTIONS = {
 
 
 class ConfigurationError(RuntimeError):
-    """Raised when a required GitHub Actions secret is missing."""
+    """Raised when required GitHub Actions configuration is invalid."""
 
 
 @dataclass
-class QQAPIError(RuntimeError):
+class RelayAPIError(RuntimeError):
     status: int
-    code: int | None
     message: str
 
     def __str__(self) -> str:
-        code = f", QQ code {self.code}" if self.code is not None else ""
-        return f"QQ API request failed (HTTP {self.status}{code}): {self.message}"
+        return f"QQ relay request failed (HTTP {self.status}): {self.message}"
 
 
 def _clean_text(value: Any, max_length: int) -> str:
@@ -189,18 +184,15 @@ def build_notification(
     return message if include_url else _remove_urls(message)
 
 
-def _decode_api_error(status: int, body: bytes) -> QQAPIError:
+def _decode_relay_error(status: int, body: bytes) -> RelayAPIError:
     message = body.decode("utf-8", errors="replace")[:500]
-    code: int | None = None
     try:
         data = json.loads(message)
         if isinstance(data, Mapping):
-            raw_code = data.get("code")
-            code = int(raw_code) if raw_code is not None else None
-            message = str(data.get("message") or data.get("msg") or message)
+            message = str(data.get("error") or data.get("message") or message)
     except (ValueError, TypeError, json.JSONDecodeError):
         pass
-    return QQAPIError(status=status, code=code, message=_clean_text(message, 300))
+    return RelayAPIError(status=status, message=_clean_text(message, 300))
 
 
 def _post_json(url: str, payload: Mapping[str, Any], headers: Mapping[str, str]) -> dict[str, Any]:
@@ -212,57 +204,55 @@ def _post_json(url: str, payload: Mapping[str, Any], headers: Mapping[str, str])
         try:
             with urlopen(request, timeout=15) as response:
                 response_body = response.read()
-                return json.loads(response_body.decode("utf-8")) if response_body else {}
+                decoded = json.loads(response_body.decode("utf-8")) if response_body else {}
+                if not isinstance(decoded, dict):
+                    raise RuntimeError("QQ relay response was not a JSON object")
+                return decoded
         except HTTPError as error:
-            api_error = _decode_api_error(error.code, error.read())
+            relay_error = _decode_relay_error(error.code, error.read())
             if error.code not in TRANSIENT_HTTP_STATUSES or attempt == 2:
-                raise api_error from error
+                raise relay_error from error
         except URLError as error:
             if attempt == 2:
-                raise RuntimeError(f"QQ API network request failed: {error.reason}") from error
+                raise RuntimeError(f"QQ relay network request failed: {error.reason}") from error
         time.sleep(2**attempt)
 
     raise AssertionError("unreachable")
 
 
-def get_access_token(app_id: str, client_secret: str) -> str:
-    response = _post_json(
-        TOKEN_URL,
-        {"appId": app_id, "clientSecret": client_secret},
-        {},
-    )
-    token = response.get("access_token")
-    if not token:
-        raise RuntimeError("QQ access-token response did not contain access_token")
-    return str(token)
+def _validated_relay_url(value: str) -> str:
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        raise ConfigurationError("QQ_RELAY_URL must be an HTTPS URL without credentials or a fragment")
+    return value
 
 
-def send_group_message(group_openid: str, access_token: str, content: str) -> dict[str, Any]:
-    encoded_group = quote(group_openid, safe="")
+def send_relay_message(
+    relay_url: str,
+    relay_token: str,
+    repository: str,
+    delivery_id: str,
+    content: str,
+) -> dict[str, Any]:
     return _post_json(
-        f"{API_BASE_URL}/v2/groups/{encoded_group}/messages",
-        {"msg_type": 0, "content": content},
-        {"Authorization": f"QQBot {access_token}"},
+        _validated_relay_url(relay_url),
+        {
+            "repository": repository,
+            "delivery_id": delivery_id,
+            "message": content,
+        },
+        {"Authorization": f"Bearer {relay_token}"},
     )
 
 
-def send_with_url_fallback(
-    group_openid: str,
-    access_token: str,
-    content_with_url: str,
-    content_without_url: str,
-) -> tuple[dict[str, Any], bool]:
-    """Retry without the GitHub URL when the bot has no URL permission."""
-    try:
-        return send_group_message(group_openid, access_token, content_with_url), False
-    except QQAPIError as error:
-        if error.code != URL_REJECTED_CODE or content_with_url == content_without_url:
-            raise
-    return send_group_message(group_openid, access_token, content_without_url), True
-
-
-def _required_environment() -> tuple[str, str, str]:
-    names = ("QQ_BOT_APP_ID", "QQ_BOT_CLIENT_SECRET", "QQ_GROUP_OPENID")
+def _required_environment() -> tuple[str, str]:
+    names = ("QQ_RELAY_URL", "QQ_RELAY_TOKEN")
     missing = [name for name in names if not os.environ.get(name)]
     if missing:
         raise ConfigurationError("Missing required GitHub Actions secrets: " + ", ".join(missing))
@@ -289,11 +279,8 @@ def main() -> int:
     run_url = f"{server_url}/{repository}/actions/runs/{run_id}" if run_id else ""
     include_url = _is_true(os.environ.get("QQ_INCLUDE_URL", "true"))
 
-    message_with_url = build_notification(
+    message = build_notification(
         event_name, payload, repository, actor, run_url, include_url=include_url
-    )
-    message_without_url = build_notification(
-        event_name, payload, repository, actor, run_url, include_url=False
     )
 
     action = _clean_text(payload.get("action") or "manual", 60)
@@ -301,13 +288,13 @@ def main() -> int:
         print(f"QQ notification dry run passed: event={event_name}, action={action}")
         return 0
 
-    app_id, client_secret, group_openid = _required_environment()
-    token = get_access_token(app_id, client_secret)
-    response, removed_url = send_with_url_fallback(
-        group_openid, token, message_with_url, message_without_url
-    )
-    message_id = _clean_text(response.get("id"), 160)
-    suffix = "; URL removed by fallback" if removed_url else ""
+    if not run_id:
+        raise ConfigurationError("GITHUB_RUN_ID is required for relay deduplication")
+    relay_url, relay_token = _required_environment()
+    response = send_relay_message(relay_url, relay_token, repository, run_id, message)
+    message_id = _clean_text(response.get("message_id"), 160)
+    duplicate = bool(response.get("duplicate"))
+    suffix = "; duplicate suppressed" if duplicate else ""
     print(f"QQ notification sent: message_id={message_id or 'unknown'}{suffix}")
     return 0
 
@@ -315,6 +302,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (ConfigurationError, QQAPIError, RuntimeError, ValueError) as error:
+    except (ConfigurationError, RelayAPIError, RuntimeError, ValueError) as error:
         print(f"QQ notification failed: {error}", file=sys.stderr)
         sys.exit(1)
