@@ -11,6 +11,10 @@ import { LoginDetailType } from '@/typings/enterprise/oauth';
 import { removeOpenScreenAnimation } from '@/utils/dom';
 import { isDesktop } from '@/utils/env';
 import { getAllUrlParams, getUrlParam, openWebPage } from '@/utils/url';
+import {
+  createVerificationCodeCountdownLifecycle,
+  type VerificationCodeCountdownLifecycle,
+} from '@/utils/verificationCodeCountdown';
 import { Icon } from '@chat2db/ui';
 import { Button, Divider, Form, Input } from 'antd';
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react';
@@ -37,7 +41,7 @@ export default memo<IProps>(() => {
   const [submitLoading, setSubmitLoading] = useState<boolean>(false);
   const [isWechatLogin, setIsWechatLogin] = useState<boolean>(isCN);
   const [form] = Form.useForm();
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownLifecycleRef = useRef<VerificationCodeCountdownLifecycle | null>(null);
   const [loginUrls, setLoginUrls] = useState<{
     githubLoginUrl: string;
     googleLoginUrl: string;
@@ -111,10 +115,12 @@ export default memo<IProps>(() => {
   }, [appConfig.curCountry]);
 
   useEffect(() => {
+    const lifecycle = createVerificationCodeCountdownLifecycle(setCodeCountDown);
+    countdownLifecycleRef.current = lifecycle;
     return () => {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
+      lifecycle.dispose();
+      if (countdownLifecycleRef.current === lifecycle) {
+        countdownLifecycleRef.current = null;
       }
     };
   }, []);
@@ -124,32 +130,26 @@ export default memo<IProps>(() => {
   }
 
   const handleSendSMSAndStartTiming = () => {
+    const lifecycle = countdownLifecycleRef.current;
+    if (!lifecycle) {
+      return;
+    }
+    const request = lifecycle.beginRequest();
     // Validate the email address.
     form.validateFields(['email']).then(() => {
+      if (!request.isCurrent()) {
+        return;
+      }
       const email = form.getFieldValue('email');
       setSendCodeLoading(true);
-      userServices
-        .sendEmailSMS({ email })
-        .then(() => {
-          let countdown = 60;
-          setCodeCountDown(countdown);
-          if (timerRef.current) {
-            clearInterval(timerRef.current);
-          }
-          timerRef.current = setInterval(() => {
-            countdown -= 1;
-            setCodeCountDown(countdown);
-            if (countdown === 0) {
-              clearInterval(timerRef.current!);
-              timerRef.current = null;
-              setCodeCountDown(null);
-            }
-          }, 1000);
-        })
-        .finally(() => {
-          setSendCodeCount(sendCodeCount + 1);
+      request.track(
+        userServices.sendEmailSMS({ email }),
+        () => request.startCountdown(),
+        () => {
+          setSendCodeCount((count) => count + 1);
           setSendCodeLoading(false);
-        });
+        },
+      );
     });
   };
 
