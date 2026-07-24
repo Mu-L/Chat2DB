@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
 import notify_qq
@@ -151,6 +151,19 @@ class NotificationFormattingTest(unittest.TestCase):
 
 
 class RelayClientTest(unittest.TestCase):
+    @patch("notify_qq.urlopen")
+    def test_http_client_sets_explicit_user_agent(self, urlopen_mock):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"{}"
+        urlopen_mock.return_value = response
+
+        notify_qq._post_json("https://qq-relay.example.com/v1/qq/github", {}, {})
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(
+            "Chat2DB-GitHub-Notifier/1.0", request.get_header("User-agent")
+        )
+
     @patch("notify_qq._post_json")
     def test_relay_request_uses_bearer_token_and_delivery_id(self, post_json):
         post_json.return_value = {"ok": True, "message_id": "42"}

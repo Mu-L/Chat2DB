@@ -197,7 +197,11 @@ def _decode_relay_error(status: int, body: bytes) -> RelayAPIError:
 
 def _post_json(url: str, payload: Mapping[str, Any], headers: Mapping[str, str]) -> dict[str, Any]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request_headers = {"Content-Type": "application/json", **headers}
+    request_headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Chat2DB-GitHub-Notifier/1.0",
+        **headers,
+    }
 
     for attempt in range(3):
         request = Request(url, data=body, headers=request_headers, method="POST")
